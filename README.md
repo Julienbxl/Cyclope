@@ -72,6 +72,18 @@ make
 ./Cyclope -range=71 -target=1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU -stride=484790845027 -offset=123456789
 ```
 
+### Tests
+
+You can run 
+```bash
+./python3 testpk.py
+```
+to check ECC and you can run
+```bash
+./python3 trap.py
+```
+to verify no key is missed
+
 | Parameter | Description |
 |---|---|
 | `-range=N` | Puzzle number (key space = [2^(N-1), 2^N)) |
@@ -83,12 +95,12 @@ make
 
 ```bash
 # Full flow: generate strides → plan missions → run
-python3 cyclope_commander.py
+python3 commander.py
 
 # Step by step
-python3 cyclope_commander.py --soup     # generate strides.txt
-python3 cyclope_commander.py --plan     # generate missions.txt
-python3 cyclope_commander.py --run      # execute missions
+python3 commander.py --soup     # generate strides.txt
+python3 commander.py --plan     # generate missions.txt
+python3 commander.py --run      # execute missions
 ```
 
 ---
