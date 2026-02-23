@@ -66,12 +66,6 @@ make
 
 ## ▶️ Usage
 
-### Direct (single mission)
-
-```bash
-./Cyclope -range=71 -target=1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU -stride=484790845027 -offset=123456789
-```
-
 ### Tests
 
 You can run 
@@ -83,6 +77,12 @@ to check ECC and you can run
 python3 trap.py
 ```
 to verify no key is missed
+
+### Direct (single mission)
+
+```bash
+./Cyclope -range=71 -target=1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU -stride=484790845027 -offset=123456789
+```
 
 | Parameter | Description |
 |---|---|
