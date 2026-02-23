@@ -76,11 +76,11 @@ make
 
 You can run 
 ```bash
-./python3 testpk.py
+python3 testpk.py
 ```
 to check ECC and you can run
 ```bash
-./python3 trap.py
+python3 trap.py
 ```
 to verify no key is missed
 
