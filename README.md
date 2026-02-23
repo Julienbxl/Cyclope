@@ -15,7 +15,7 @@ CUDACyclone does brute-force over a range. Cyclope adds a **mathematical samplin
 
 - Instead of scanning every key, Cyclope scans keys matching `k ≡ rᵢ (mod pᵢ)` for several primes `pᵢ`
 - The stride and offset are computed via **CRT** (Chinese Remainder Theorem) from a set of "ingredients" — prime factors and residues observed in previously solved puzzles
-- This is orchestrated by **Cyclope Commander** (`cyclope_commander.py`), a Python script that generates strides, plans missions, and supervises GPU execution end-to-end
+- This is orchestrated by **Commander** (`commander.py`), a Python script that generates strides, plans missions, and supervises GPU execution end-to-end
 
 ---
 
