@@ -36,7 +36,6 @@
 // 1. CONFIGURATION
 // =================================================================================
 
-#define PUZZLE_ID 76
 
 #ifndef MAX_BATCH_SIZE
 // NOTE : MAX_BATCH_SIZE détermine la taille de la constant memory utilisée pour
@@ -52,16 +51,8 @@
 
 
 
-// --- TARGET HASH160 PAR PUZZLE ---
-#if PUZZLE_ID == 71
-const uint8_t TARGET_HASH_BYTES[20] = {0xf6, 0xf5, 0x43, 0x1d, 0x25, 0xbb, 0xf7, 0xb1, 0x2e, 0x8a, 0xdd, 0x9a, 0xf5, 0xe3, 0x47, 0x5c, 0x44, 0xa0, 0xa5, 0xb8};
-#elif PUZZLE_ID == 72
-const uint8_t TARGET_HASH_BYTES[20] = {0xbf, 0x74, 0x13, 0xe8, 0xdf, 0x4e, 0x7a, 0x34, 0xce, 0x9d, 0xc1, 0x3e, 0x2f, 0x26, 0x48, 0x78, 0x3e, 0xc5, 0x4a, 0xdb};
-#elif PUZZLE_ID == 76
-const uint8_t TARGET_HASH_BYTES[20] = {0x86, 0xf9, 0xfe, 0xa5, 0xcd, 0xec, 0xf0, 0x33, 0x16, 0x1d, 0xd2, 0xf8, 0xf8, 0x56, 0x07, 0x68, 0xae, 0x0a, 0x6d, 0x14};
-#else
+// Target hash160 fourni obligatoirement via -target= en ligne de commande
 const uint8_t TARGET_HASH_BYTES[20] = {0};
-#endif
 
 static volatile sig_atomic_t g_sigint = 0;
 static void handle_sigint(int) { g_sigint = 1; }
@@ -199,7 +190,7 @@ static unsigned __int128 parseHex128(const std::string &s) {
 }
 
 struct RuntimeConfig {
-    int puzzle_id = PUZZLE_ID;
+    int puzzle_id = 0;
     uint64_t stride = 0;
     uint64_t offset = 0;
     uint8_t target_hash[20];
