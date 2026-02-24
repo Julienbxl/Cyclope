@@ -186,12 +186,27 @@ bool addrToHash160(const std::string &addr, uint8_t hash160[20]) {
     return true;
 }
 
+// Parse une string hex (sans 0x) en unsigned __int128
+static unsigned __int128 parseHex128(const std::string &s) {
+    unsigned __int128 result = 0;
+    for (char c : s) {
+        result <<= 4;
+        if (c >= '0' && c <= '9') result |= (c - '0');
+        else if (c >= 'a' && c <= 'f') result |= (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') result |= (c - 'A' + 10);
+    }
+    return result;
+}
+
 struct RuntimeConfig {
     int puzzle_id = PUZZLE_ID;
     uint64_t stride = 0;
     uint64_t offset = 0;
     uint8_t target_hash[20];
     bool target_from_cli = false;
+    bool range_is_hex = false;
+    unsigned __int128 range_min_hex = 0;
+    unsigned __int128 range_max_hex = 0;
     void loadPuzzleTarget() { memcpy(target_hash, TARGET_HASH_BYTES, 20); }
 };
 
@@ -220,7 +235,16 @@ RuntimeConfig parseRuntimeArgs(int argc, char **argv) {
         std::string val;
         if (parseArg(argv[i], "stride", val)) { cfg.stride = std::stoull(val); }
         else if (parseArg(argv[i], "offset", val)) { cfg.offset = std::stoull(val); }
-        else if (parseArg(argv[i], "range", val)) { cfg.puzzle_id = std::stoi(val); }
+        else if (parseArg(argv[i], "range", val)) {
+            auto colon = val.find(':');
+            if (colon != std::string::npos) {
+                cfg.range_is_hex = true;
+                cfg.range_min_hex = parseHex128(val.substr(0, colon));
+                cfg.range_max_hex = parseHex128(val.substr(colon + 1));
+            } else {
+                cfg.puzzle_id = std::stoi(val);
+            }
+        }
         else if (parseArg(argv[i], "target", val)) {
             if (val.length() > 30) {
                 if (addrToHash160(val, cfg.target_hash)) cfg.target_from_cli = true;
@@ -695,7 +719,7 @@ std::string https_get(const std::string& host, const std::string& path) {
 }
 
 void sendTelegramMessage(const std::string& message) {
-    const char* bot_token = getenv("TELEGRAM_BOT_TOKEN");
+	const char* bot_token = getenv("TELEGRAM_BOT_TOKEN");
     const char* chat_id   = getenv("TELEGRAM_CHAT_ID");
 
     if (!bot_token || bot_token[0] == '\0') return;
@@ -729,9 +753,7 @@ int main(int argc, char *argv[]) {
     RuntimeConfig cfg = parseRuntimeArgs(argc, argv);
 
     if (cfg.stride == 0) {
-        std::cerr << "Erreur : -stride=<valeur> est obligatoire.\n";
-        std::cerr << "Exemple : ./Cyclope -range=72 -stride=821027694461 -offset=350675963729 -target=<adresse>\n";
-        return 1;
+        cfg.stride = 1;  // mode exploration sequentielle (stride/offset non fournis)
     }
     if (!cfg.target_from_cli) {
         std::cerr << "Erreur : -target=<adresse> est obligatoire.\n";
@@ -740,8 +762,12 @@ int main(int argc, char *argv[]) {
     }
     // offset=0 est une valeur valide (CRT peut produire offset=0)
 
-    unsigned __int128 range_min_128 = ((unsigned __int128)1 << (cfg.puzzle_id - 1));
-    unsigned __int128 range_max_128 = ((unsigned __int128)1 << cfg.puzzle_id);
+    unsigned __int128 range_min_128 = cfg.range_is_hex
+        ? cfg.range_min_hex
+        : ((unsigned __int128)1 << (cfg.puzzle_id - 1));
+    unsigned __int128 range_max_128 = cfg.range_is_hex
+        ? cfg.range_max_hex
+        : ((unsigned __int128)1 << cfg.puzzle_id);
     unsigned __int128 stride_128    = (unsigned __int128)cfg.stride;
     unsigned __int128 offset_128    = (unsigned __int128)cfg.offset;
     unsigned __int128 dist          = (range_min_128 > offset_128) ? (range_min_128 - offset_128) : 0;
@@ -801,7 +827,20 @@ int main(int argc, char *argv[]) {
     std::cout << "GPU         : " << prop.name << " (" << prop.multiProcessorCount << " SM)\n";
     std::cout << "Blocs       : " << blocks << " (" << blocks / prop.multiProcessorCount << " blocs/SM)\n";
     std::cout << "Threads     : " << total_threads << "\n";
-    std::cout << "Target      : Puzzle " << cfg.puzzle_id << "\n";
+    std::cout << "Target      : ";
+    if (cfg.range_is_hex) {
+        auto print128hex = [](unsigned __int128 v) {
+            uint64_t hi = (uint64_t)(v >> 64), lo = (uint64_t)v;
+            if (hi) std::cout << std::hex << hi;
+            std::cout << std::hex << std::setfill('0') << std::setw(hi ? 16 : 1) << lo << std::dec;
+        };
+        print128hex(cfg.range_min_hex);
+        std::cout << ":";
+        print128hex(cfg.range_max_hex);
+        std::cout << "\n";
+    } else {
+        std::cout << "Puzzle " << cfg.puzzle_id << "\n";
+    }
     std::cout << "Keys        : " << total_keys_double/1e6 << " M\n";
 
     unsigned __int128 half_jump = (unsigned __int128)(batch_size / 2) * stride_eff_128;
