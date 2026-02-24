@@ -22,9 +22,9 @@ CUDACyclone does brute-force over a range. Cyclope adds a **mathematical samplin
 ## 🏗️ Architecture
 
 ```
-cyclope_commander.py
-├── SOUP      → generates (stride, offset) pairs via CRT
-├── PLANNER   → filters pairs by estimated execution time per puzzle
+commander.py
+├── SOUP       → generates (stride, offset) pairs via CRT
+├── PLANNER    → filters pairs by estimated execution time per puzzle
 └── SUPERVISOR → launches Cyclope GPU missions one by one, detects victories
 ```
 
@@ -55,6 +55,7 @@ make
 
 > **GPU Architecture** : the Makefile is set to `sm_120` (RTX 5000 series / Blackwell).  
 > Edit `GENCODE` in the Makefile for your GPU:
+>
 > | GPU Series | sm |
 > |---|---|
 > | RTX 5000 (Blackwell) | sm_120 |
@@ -66,30 +67,32 @@ make
 
 ## ▶️ Usage
 
-### Tests
-
-You can run 
-```bash
-python3 testpk.py
-```
-to check ECC and you can run
-```bash
-python3 trap.py
-```
-to verify no key is missed
-
 ### Direct (single mission)
 
 ```bash
-./Cyclope -range=71 -target=1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU -stride=484790845027 -offset=123456789
+# Sequential scan — no stride/offset needed, scans every key from range_min
+./Cyclope -range=71 -target=1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU
+
+# Sequential scan on an explicit hex sub-range
+./Cyclope -range=796F00000000000000:7975FFFFFFFFFFFFFF -target=1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU
+
+# CRT stride attack — puzzle number mode
+./Cyclope -range=71 -target=1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU -stride=484790845027 -offset=22
+
+# CRT stride attack — explicit hex range
+./Cyclope -range=796F00000000000000:7975FFFFFFFFFFFFFF -target=1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU -stride=484790845027 -offset=22
 ```
 
 | Parameter | Description |
 |---|---|
-| `-range=N` | Puzzle number (key space = [2^(N-1), 2^N)) |
+| `-range=N` | Puzzle number — scans `[2^(N-1), 2^N)` |
+| `-range=MIN:MAX` | Explicit hex range — scans `[MIN, MAX]` (hex values, no `0x` prefix) |
 | `-target=<addr>` | Bitcoin address to search for |
-| `-stride=<val>` | Step between tested keys |
-| `-offset=<val>` | Starting offset (0 is valid) |
+| `-stride=<val>` | Step between tested keys (default: `1` — sequential scan) |
+| `-offset=<val>` | Starting offset, default: `0` (`0` is valid) |
+
+> If `-stride` is omitted, Cyclope defaults to `stride=1, offset=0` — a plain sequential scan from the start of the range.  
+> The hex range mode is useful to target a specific sub-zone of a puzzle instead of the full range.
 
 ### Via Commander (recommended)
 
@@ -98,10 +101,52 @@ to verify no key is missed
 python3 commander.py
 
 # Step by step
-python3 commander.py --soup     # generate strides.txt
-python3 commander.py --plan     # generate missions.txt
-python3 commander.py --run      # execute missions
+python3 commander.py --soup     # generate strides.txt via CRT
+python3 commander.py --plan     # generate missions.txt (filtered & sorted)
+python3 commander.py --run      # execute missions one by one
+python3 commander.py --run --file=custom.txt  # run a custom mission file
 ```
+
+---
+
+## 🧪 Testing & Validation
+
+Two test utilities are included to verify Cyclope's correctness before running real missions.
+
+### `testpk.py` — ECC & Hash160 correctness
+
+Generates random private keys, computes the expected Bitcoin address in Python (using `fastecdsa` as reference), then calls Cyclope's `-testpk` mode and compares results.
+
+```bash
+pip install fastecdsa base58
+python3 testpk.py
+```
+
+Expected output:
+```
+============================================================
+  🚀 CYCLOPE TEST: Validation ECC & Hash (50 tests) 🚀
+============================================================
+  Test 1/50 ...  ✅ OK
+  Test 2/50 ...  ✅ OK
+  ...
+  [Résultat] ✅ SUCCÈS TOTAL : 50 clés validées !
+```
+
+### `trap.py` — No key skipping
+
+Verifies that Cyclope does not miss any key in a given range. Plants known keys (traps) in the search space, runs Cyclope, and checks that every trap was found.
+
+```bash
+python3 trap.py
+```
+
+Expected output:
+```
+All traps found ✅ — no key skipping detected.
+```
+
+> Run both tests after any recompilation or modification to the CUDA kernel.
 
 ---
 
