@@ -48,7 +48,7 @@ sudo apt install cuda-toolkit-13-1
 ## 🛠️ Build
 
 ```bash
-git clone https://github.com/<your-username>/Cyclope.git
+git clone https://github.com/Julienbxl/Cyclope.git
 cd Cyclope
 make
 ```
@@ -165,7 +165,7 @@ export TELEGRAM_CHAT_ID="your_chat_id"
 
 | GPU | Speed |
 |---|---|
-| RTX 5060 (sm_120) | ~1400 MK/s |
+| RTX 5060 (sm_120) | ~1500 MK/s |
 
 ---
 
