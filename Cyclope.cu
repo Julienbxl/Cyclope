@@ -494,7 +494,7 @@ __global__ void __launch_bounds__(256, 2) kernel_solve(
     uint64_t threadsTotal, uint32_t batch_size, uint32_t max_batches_per_launch,
     int* __restrict__ d_found_flag, FoundResult* __restrict__ d_found_result,
     unsigned long long* __restrict__ hashes_accum,
-    uint64_t stride_val)
+    const uint64_t* __restrict__ stride_256)
 {
     const int B = (int)batch_size;
     if (B <= 0 || (B & 1) || B > MAX_BATCH_SIZE) return;
@@ -521,7 +521,6 @@ __global__ void __launch_bounds__(256, 2) kernel_solve(
     if ((rem[0]|rem[1]|rem[2]|rem[3]) == 0ull) return;
 
     uint32_t batches_done = 0;
-    const uint64_t scalar_jump = stride_val * (uint64_t)batch_size;
 
     while (batches_done < max_batches_per_launch) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) {
@@ -536,12 +535,14 @@ __global__ void __launch_bounds__(256, 2) kernel_solve(
             check_twin_candidate(x1, odd_pos, S, 0, false, gid, lane, d_found_flag, d_found_result, local_hashes, hashes_accum);
         }
 
-        // Batch step
+		// Batch step
         core_batch_step<false>(x1, y1, S, batch_size, half, d_found_flag, d_found_result,
             &local_hashes, hashes_accum, c_target_prefix, gid, lane, full_mask);
 
-        // Update scalaire
-        scalarAdd256_PTX(S, scalar_jump);
+        // Update scalaire : UTILISE LE STRIDE 256 BITS
+        scalarAdd256_Full_PTX(S, stride_256); // <-- CORRIGÉ
+    
+        // Décrémentation du compteur de clés restant
         sub256_u64_inplace(rem, (uint64_t)batch_size);
         ++batches_done;
     }
@@ -559,30 +560,40 @@ __global__ void __launch_bounds__(256, 2) kernel_solve(
 }
 
 // --- INITIALISATION ---
-__global__ void kernel_init_scalars_stride(uint64_t *d_scalars, uint64_t bl, uint64_t bh, uint64_t st, int bs, int tot, int mode) {
+// --- INITIALISATION (Version 128-bit Stride) ---
+__global__ void kernel_init_scalars_stride(uint64_t *d_scalars, uint64_t bl, uint64_t bh, uint64_t st_lo, uint64_t st_hi, int bs, int tot, int mode) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= tot) return;
+    
     unsigned __int128 res;
-    if (mode == 0) {
+    unsigned __int128 stride_128 = ((unsigned __int128)st_hi << 64) | st_lo;
+
+    if (mode == 0) { // Mode Recherche
         unsigned __int128 base_128 = ((unsigned __int128)bh << 64) | bl;
-        unsigned __int128 spacing  = (unsigned __int128)st * (unsigned __int128)bs;
-        res = base_128 + (spacing * idx);
-    } else {
-        res = (unsigned __int128)(idx + 1) * (unsigned __int128)st;
+        unsigned __int128 spacing  = stride_128 * (unsigned __int128)bs;
+        res = base_128 + (spacing * (unsigned __int128)idx);
+    } else { // Mode Initialisation Tables
+        res = (unsigned __int128)(idx + 1) * stride_128;
     }
-    d_scalars[idx * 4 + 0] = (uint64_t)(res & 0xFFFFFFFFFFFFFFFFULL);
+
+    d_scalars[idx * 4 + 0] = (uint64_t)(res);
     d_scalars[idx * 4 + 1] = (uint64_t)(res >> 64);
-    d_scalars[idx * 4 + 2] = 0ULL; d_scalars[idx * 4 + 3] = 0ULL;
+    d_scalars[idx * 4 + 2] = 0ULL; 
+    d_scalars[idx * 4 + 3] = 0ULL;
 }
 
-void init_stride_tables(uint32_t batch_size, uint64_t effective_stride) {
+void init_stride_tables(uint32_t batch_size, unsigned __int128 effective_stride) {
     const uint32_t half = batch_size >> 1;
     uint64_t *d_s, *d_x, *d_y;
-    cudaMalloc(&d_s, batch_size*32);
-    cudaMalloc(&d_x, batch_size*32);
-    cudaMalloc(&d_y, batch_size*32);
+    cudaMalloc(&d_s, batch_size * 32);
+    cudaMalloc(&d_x, batch_size * 32);
+    cudaMalloc(&d_y, batch_size * 32);
 
-    kernel_init_scalars_stride<<<1, 256>>>(d_s, 0, 0, effective_stride, 1, (int)batch_size, 1);
+    // Séparation du stride pour le kernel
+    uint64_t st_lo = (uint64_t)effective_stride;
+    uint64_t st_hi = (uint64_t)(effective_stride >> 64);
+
+    kernel_init_scalars_stride<<<1, 256>>>(d_s, 0, 0, st_lo, st_hi, 1, (int)batch_size, 1);
     scalarMulKernelBase<<<1, 256>>>(d_s, d_x, d_y, (int)batch_size);
     cudaDeviceSynchronize();
 
@@ -734,31 +745,34 @@ void sendTelegramMessage(const std::string& message) {
 }
 
 // =================================================================================
-// 8. MAIN
+// 8. MAIN (VERSION CORRIGÉE 128-BIT STRIDE)
 // =================================================================================
 int main(int argc, char *argv[]) {
+    // 1. Gestion du mode test
     if (argc >= 3 && std::string(argv[1]) == "-testpk") {
         int dev = 0; cudaSetDevice(dev); run_test_pk(argc, argv);
     }
 
+    // 2. Parsing des arguments
     RuntimeConfig cfg = parseRuntimeArgs(argc, argv);
 
     if (cfg.stride == 0) {
-        cfg.stride = 1;  // mode exploration sequentielle (stride/offset non fournis)
+        cfg.stride = 1;  // mode exploration sequentielle
     }
     if (!cfg.target_from_cli) {
         std::cerr << "Erreur : -target=<adresse> est obligatoire.\n";
-        std::cerr << "Exemple : ./Cyclope -range=72 -stride=821027694461 -offset=350675963729 -target=<adresse>\n";
+        std::cerr << "Exemple : ./Cyclope -range=131 -stride=... -target=<adresse>\n";
         return 1;
     }
-    // offset=0 est une valeur valide (CRT peut produire offset=0)
 
+    // 3. Calculs du Range en 128-bit (Indispensable pour Range 131+)
     unsigned __int128 range_min_128 = cfg.range_is_hex
         ? cfg.range_min_hex
         : ((unsigned __int128)1 << (cfg.puzzle_id - 1));
     unsigned __int128 range_max_128 = cfg.range_is_hex
         ? cfg.range_max_hex
         : ((unsigned __int128)1 << cfg.puzzle_id);
+    
     unsigned __int128 stride_128    = (unsigned __int128)cfg.stride;
     unsigned __int128 offset_128    = (unsigned __int128)cfg.offset;
     unsigned __int128 dist          = (range_min_128 > offset_128) ? (range_min_128 - offset_128) : 0;
@@ -767,37 +781,39 @@ int main(int argc, char *argv[]) {
     unsigned __int128 total_keys_128 = (range_max_128 - aligned_start) / stride_128 + 1;
     double total_keys_double = (double)total_keys_128;
 
+    // 4. Initialisation Device
     int device = 0;
     cudaSetDevice(device);
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, device);
 
     int threads = 256;
-
-    // Calcul du nombre de blocs : on vise un multiple élevé des SM pour saturer
-    // la file d'exécution et masquer les latences mémoire.
-    // Le facteur 128 est empiriquement bon pour les kernels lourds en registres
-    // comme celui-ci (ECC + hash). cudaOccupancyMaxActiveBlocksPerMultiprocessor
-    // retournerait seulement 2 à cause du __launch_bounds__(256,2), ce qui
-    // sous-utiliserait massivement le GPU (factor 64x trop peu de blocs).
     int blocks = prop.multiProcessorCount * 128;
-
     int total_threads = blocks * threads;
 
+    // 5. Calcul des Strides (Correction du bug de dépassement uint64)
     unsigned __int128 stride_eff_128 = stride_128 * (unsigned __int128)total_threads;
-    uint64_t stride_eff_val = (uint64_t)stride_eff_128;
+    
+    // On prépare le saut total (stride effectif * batch size) en 256 bits pour le GPU
+    unsigned __int128 stride_batch_jump = stride_eff_128 * (unsigned __int128)MAX_BATCH_SIZE;
+    uint64_t h_stride_jump_256[4] = {(uint64_t)stride_batch_jump, (uint64_t)(stride_batch_jump >> 64), 0, 0};
+    uint64_t *d_stride_jump_256;
+    cudaMalloc(&d_stride_jump_256, 32);
+    cudaMemcpy(d_stride_jump_256, h_stride_jump_256, 32, cudaMemcpyHostToDevice);
 
     uint32_t batch_size = MAX_BATCH_SIZE;
     uint32_t loops = 64;
 
+    // 6. Setup des cibles
     uint32_t pfx = (cfg.target_hash[3]<<24)|(cfg.target_hash[2]<<16)|(cfg.target_hash[1]<<8)|cfg.target_hash[0];
     cudaMemcpyToSymbol(c_target_prefix, &pfx, 4);
     cudaMemcpyToSymbol(c_target_hash160, cfg.target_hash, 20);
 
+    // 7. Allocation Mémoire GPU
     uint64_t *d_s, *d_x, *d_y, *d_rx, *d_ry, *d_cnt;
     int *d_flg;
     FoundResult *d_res;
-    unsigned long long *d_chk; // conservé pour hashes_accum (paramètre kernel)
+    unsigned long long *d_chk;
 
     cudaMalloc(&d_s,   total_threads*32);
     cudaMalloc(&d_x,   total_threads*32);
@@ -812,35 +828,18 @@ int main(int argc, char *argv[]) {
     cudaMemset(d_flg, 0, 4);
     cudaMemset(d_chk, 0, 8);
 
-    init_stride_tables(batch_size, stride_eff_val);
+    // 8. Initialisation des points de départ
+    init_stride_tables(batch_size, stride_eff_128);
 
-    std::cout << "======== CYCLOPE V1.0 ================\n";
-    std::cout << "GPU         : " << prop.name << " (" << prop.multiProcessorCount << " SM)\n";
-    std::cout << "Blocs       : " << blocks << " (" << blocks / prop.multiProcessorCount << " blocs/SM)\n";
-    std::cout << "Threads     : " << total_threads << "\n";
-    std::cout << "Target      : ";
-    if (cfg.range_is_hex) {
-        auto print128hex = [](unsigned __int128 v) {
-            uint64_t hi = (uint64_t)(v >> 64), lo = (uint64_t)v;
-            if (hi) std::cout << std::hex << hi;
-            std::cout << std::hex << std::setfill('0') << std::setw(hi ? 16 : 1) << lo << std::dec;
-        };
-        print128hex(cfg.range_min_hex);
-        std::cout << ":";
-        print128hex(cfg.range_max_hex);
-        std::cout << "\n";
-    } else {
-        std::cout << "Puzzle " << cfg.puzzle_id << "\n";
-    }
-    std::cout << "Keys        : " << total_keys_double/1e6 << " M\n";
-
+    // Calcul du point de départ centré (start + half_jump)
     unsigned __int128 half_jump = (unsigned __int128)(batch_size / 2) * stride_eff_128;
     unsigned __int128 start_centered = aligned_start + half_jump;
 
+    // Lancement de l'initialisation des scalaires (Correction: passe st_lo et st_hi)
     kernel_init_scalars_stride<<<blocks, threads>>>(
         d_s,
         (uint64_t)start_centered, (uint64_t)(start_centered >> 64),
-        cfg.stride,
+        (uint64_t)stride_128, (uint64_t)(stride_128 >> 64),
         1,
         total_threads,
         0
@@ -848,15 +847,29 @@ int main(int argc, char *argv[]) {
 
     scalarMulKernelBase<<<blocks, threads>>>(d_s, d_x, d_y, total_threads);
     cudaDeviceSynchronize();
-
     cudaMemset(d_cnt, 0xFF, total_threads*32);
 
+    // 9. Affichage Info Console
+    std::cout << "======== CYCLOPE V1.1 (128-bit Engine) ================\n";
+    std::cout << "GPU         : " << prop.name << "\n";
+    std::cout << "Target      : ";
+    if (cfg.range_is_hex) {
+        auto print128hex = [](unsigned __int128 v) {
+            uint64_t hi = (uint64_t)(v >> 64), lo = (uint64_t)v;
+            if (hi) std::cout << std::hex << hi;
+            std::cout << std::hex << std::setfill('0') << std::setw(hi ? 16 : 1) << lo << std::dec;
+        };
+        print128hex(cfg.range_min_hex); std::cout << ":"; print128hex(cfg.range_max_hex); std::cout << "\n";
+    } else {
+        std::cout << "Puzzle " << cfg.puzzle_id << "\n";
+    }
+    std::cout << "Keys Total  : " << total_keys_double/1e6 << " M\n";
+
+    // 10. Boucle de Recherche
     std::cout << "Running Search...\n";
     signal(SIGINT, handle_sigint);
     auto t0     = std::chrono::high_resolution_clock::now();
     auto t_last = t0;
-
-    double keys_hashed  = 0;
     double range_covered = 0;
     int found = 0;
 
@@ -865,53 +878,42 @@ int main(int argc, char *argv[]) {
             d_x, d_y, d_rx, d_ry, d_s, d_cnt,
             total_threads, batch_size, loops,
             d_flg, d_res, d_chk,
-            stride_eff_val
+            d_stride_jump_256 // Correction: passe le saut 256-bit complet
         );
 
         cudaError_t err = cudaDeviceSynchronize();
-        if (err != cudaSuccess) {
-            std::cerr << "CUDA Error: " << cudaGetErrorString(err) << std::endl;
-            break;
-        }
+        if (err != cudaSuccess) { break; }
 
         cudaMemcpy(&found, d_flg, 4, cudaMemcpyDeviceToHost);
-        std::swap(d_x, d_rx);
-        std::swap(d_y, d_ry);
+        std::swap(d_x, d_rx); std::swap(d_y, d_ry);
 
         double current_hashes = (double)total_threads * (double)batch_size * (double)loops;
-        keys_hashed   += current_hashes;
         range_covered += current_hashes;
 
         auto now = std::chrono::high_resolution_clock::now();
         double dt = std::chrono::duration<double>(now - t_last).count();
 
         if (dt > 1.0) {
-            double hashrate    = current_hashes / dt / 1e6;
-            double elapsed     = std::chrono::duration<double>(now - t0).count();
-            double avg_speed   = range_covered / elapsed;
-            double remaining   = total_keys_double - range_covered;
-            double eta_sec     = (avg_speed > 0) ? (remaining / avg_speed) : 0;
-
-            int h = (int)(eta_sec / 3600);
-            int m = (int)((eta_sec - h*3600) / 60);
-            int s = (int)((long long)eta_sec % 60);
-
+            double hashrate = current_hashes / dt / 1e6;
             double progress = std::min((range_covered / total_keys_double) * 100.0, 100.0);
+            
+            // Calcul ETA
+            double elapsed = std::chrono::duration<double>(now - t0).count();
+            double avg_speed = range_covered / elapsed;
+            double remaining = total_keys_double - range_covered;
+            double eta_sec = (avg_speed > 0) ? (remaining / avg_speed) : 0;
+            int h = (int)(eta_sec / 3600); int m = (int)((eta_sec - h*3600) / 60); int s = (int)((long long)eta_sec % 60);
 
             std::cout << "\r[Speed] " << std::fixed << std::setprecision(2) << hashrate
                       << " MK/s | Progress: " << std::setprecision(2) << progress << " %"
-                      << " | ETA: " << std::setfill('0') << std::setw(2) << h << ":"
-                      << std::setw(2) << m << ":" << std::setw(2) << s << std::flush;
+                      << " | ETA: " << std::setfill('0') << std::setw(2) << h << ":" << std::setw(2) << m << ":" << std::setw(2) << s << std::flush;
 
-            t_last    = now;
-            keys_hashed = 0;
+            t_last = now;
         }
-
         if (range_covered >= total_keys_double) break;
     }
 
-    std::cout << "\n";
-
+    // 11. Gestion du Résultat
     if (found) {
         FoundResult res;
         cudaMemcpy(&res, d_res, sizeof(FoundResult), cudaMemcpyDeviceToHost);
@@ -926,25 +928,19 @@ int main(int argc, char *argv[]) {
         else                u256_add_128(k_final, offset_val);
 
         print_result_key(k_final);
-        std::cout << "Rx found: " << formatHex256(res.Rx) << "\n";
-
-        // --- ENVOI TELEGRAM (si variables d'environnement configurées) ---
+        
+        // Envoi Telegram
         std::ostringstream msg;
-        msg << "*CYCLOPE HIT* \xF0\x9F\x91\x81\xEF\xB8\x8F\n\n"
-            << "*Puzzle:* #" << cfg.puzzle_id << "\n"
-            << "*Key:* `0x" << std::hex << std::setfill('0')
-            << std::setw(16) << k_final[3] << std::setw(16) << k_final[2]
-            << std::setw(16) << k_final[1] << std::setw(16) << k_final[0] << "`\n";
-
+        msg << "*CYCLOPE HIT* \xF0\x9F\x91\x81\xEF\xB8\x8F\n\n*Key:* `0x" << std::hex << std::setfill('0')
+            << std::setw(16) << k_final[3] << std::setw(16) << k_final[2] << std::setw(16) << k_final[1] << std::setw(16) << k_final[0] << "`";
         sendTelegramMessage(msg.str());
-
-    } else if (!g_sigint) {
-        std::cout << "======== RANGE FINISHED: NOT FOUND ========\n";
+    } else {
+        std::cout << "\nSearch stopped. Not found or interrupted.\n";
     }
 
-    cudaFree(d_s); cudaFree(d_x); cudaFree(d_y);
-    cudaFree(d_rx); cudaFree(d_ry); cudaFree(d_cnt);
-    cudaFree(d_flg); cudaFree(d_res); cudaFree(d_chk);
+    // 12. Cleanup
+    cudaFree(d_stride_jump_256); cudaFree(d_s); cudaFree(d_x); cudaFree(d_y);
+    cudaFree(d_rx); cudaFree(d_ry); cudaFree(d_cnt); cudaFree(d_flg); cudaFree(d_res); cudaFree(d_chk);
 
     return 0;
 }
