@@ -277,6 +277,21 @@ static std::array<uint64_t, 4> sub_256(std::array<uint64_t, 4> a, unsigned __int
     return a;
 }
 
+// 4b. Soustraction 256 bits - 256 bits (Indispensable pour calculer le total des clés)
+static std::array<uint64_t, 4> sub_256(std::array<uint64_t, 4> a, const std::array<uint64_t, 4>& b) {
+    uint64_t borrow = 0;
+    for(int i = 0; i < 4; ++i) {
+        uint64_t diff = a[i] - b[i] - borrow;
+        if (a[i] < b[i] || (a[i] == b[i] && borrow == 1)) {
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        a[i] = diff;
+    }
+    return a;
+}
+
 // 5. Conversion en Double (Pour l'affichage de progression sans overflow)
 static double to_double(const std::array<uint64_t, 4>& v) {
     return (double)v[0] + 
@@ -800,7 +815,7 @@ std::string https_get(const std::string& host, const std::string& path) {
 void sendTelegramMessage(const std::string& message) {
 	const char* bot_token = getenv("TELEGRAM_BOT_TOKEN");
     const char* chat_id   = getenv("TELEGRAM_CHAT_ID");
-
+	
     if (!bot_token || bot_token[0] == '\0') return;
     if (!chat_id   || chat_id[0]   == '\0') return;
 
@@ -866,7 +881,8 @@ int main(int argc, char *argv[]) {
     std::array<uint64_t, 4> aligned_start = add_256(range_min_256, adjustment);
     
     // Calcul de total_keys en double pour l'ETA (évite l'overflow)
-    double total_keys_double = (to_double(range_max_256) - to_double(aligned_start)) / (double)stride_128 + 1.0;
+	std::array<uint64_t, 4> range_diff = sub_256(range_max_256, aligned_start);
+    double total_keys_double = to_double(range_diff) / (double)stride_128 + 1.0;
 
     // 4. Initialisation Device
     int device = 0;
