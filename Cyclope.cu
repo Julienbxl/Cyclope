@@ -1,6 +1,6 @@
 /*
  * ======================================================================================
- * CYCLOPE V1.0
+ * CYCLOPE V1.2
  * ======================================================================================
  */
 
@@ -19,6 +19,7 @@
 #include <iostream>
 #include <sstream>
 #include <vector>
+#include <array>
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -177,18 +178,6 @@ bool addrToHash160(const std::string &addr, uint8_t hash160[20]) {
     return true;
 }
 
-// Parse une string hex (sans 0x) en unsigned __int128
-static unsigned __int128 parseHex128(const std::string &s) {
-    unsigned __int128 result = 0;
-    for (char c : s) {
-        result <<= 4;
-        if (c >= '0' && c <= '9') result |= (c - '0');
-        else if (c >= 'a' && c <= 'f') result |= (c - 'a' + 10);
-        else if (c >= 'A' && c <= 'F') result |= (c - 'A' + 10);
-    }
-    return result;
-}
-
 struct RuntimeConfig {
     int puzzle_id = 0;
     uint64_t stride = 0;
@@ -196,8 +185,8 @@ struct RuntimeConfig {
     uint8_t target_hash[20];
     bool target_from_cli = false;
     bool range_is_hex = false;
-    unsigned __int128 range_min_hex = 0;
-    unsigned __int128 range_max_hex = 0;
+	std::array<uint64_t, 4> range_min_256 = {0,0,0,0};
+    std::array<uint64_t, 4> range_max_256 = {0,0,0,0};
     void loadPuzzleTarget() { memcpy(target_hash, TARGET_HASH_BYTES, 20); }
 };
 
@@ -220,6 +209,82 @@ bool parseHexKey(const char *hex, uint64_t k[4]) {
     return true;
 }
 
+// 1. Parsing robuste sur 256 bits
+static std::array<uint64_t, 4> parseHex256(const std::string &hex_str) {
+    std::array<uint64_t, 4> res = {0, 0, 0, 0};
+    std::string s = hex_str;
+    if (s.length() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s = s.substr(2);
+
+    for (char c : s) {
+        uint64_t val = 0;
+        if (c >= '0' && c <= '9')      val = c - '0';
+        else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+
+        uint64_t carry0 = res[0] >> 60;
+        uint64_t carry1 = res[1] >> 60;
+        uint64_t carry2 = res[2] >> 60;
+
+        res[0] = (res[0] << 4) | val;
+        res[1] = (res[1] << 4) | carry0;
+        res[2] = (res[2] << 4) | carry1;
+        res[3] = (res[3] << 4) | carry2;
+    }
+    return res;
+}
+
+// 2. Modulo 256-bit par 128-bit (Indispensable pour l'alignement CRT)
+static unsigned __int128 mod_stride(const std::array<uint64_t, 4>& a, unsigned __int128 stride) {
+    if (stride == 0) return 0;
+    unsigned __int128 rem = 0;
+    for (int i = 255; i >= 0; i--) {
+        int limb = i / 64;
+        int bit = i % 64;
+        rem = (rem << 1) | ((a[limb] >> bit) & 1);
+        if (rem >= stride) rem -= stride;
+    }
+    return rem;
+}
+
+// 3. Addition 256 bits + 128 bits
+static std::array<uint64_t, 4> add_256(std::array<uint64_t, 4> a, unsigned __int128 b) {
+    uint64_t b0 = (uint64_t)b;
+    uint64_t b1 = (uint64_t)(b >> 64);
+    unsigned __int128 sum0 = (unsigned __int128)a[0] + b0;
+    a[0] = (uint64_t)sum0;
+    unsigned __int128 sum1 = (unsigned __int128)a[1] + b1 + (sum0 >> 64);
+    a[1] = (uint64_t)sum1;
+    unsigned __int128 sum2 = (unsigned __int128)a[2] + (sum1 >> 64);
+    a[2] = (uint64_t)sum2;
+    a[3] += (uint64_t)(sum2 >> 64);
+    return a;
+}
+
+// 4. Soustraction 256 bits - 128 bits
+static std::array<uint64_t, 4> sub_256(std::array<uint64_t, 4> a, unsigned __int128 b) {
+    uint64_t b0 = (uint64_t)b;
+    uint64_t b1 = (uint64_t)(b >> 64);
+    uint64_t borrow = 0;
+    if (a[0] < b0) borrow = 1;
+    a[0] -= b0;
+    uint64_t sub1 = b1 + borrow;
+    borrow = (a[1] < sub1) ? 1 : 0;
+    a[1] -= sub1;
+    uint64_t sub2 = borrow;
+    borrow = (a[2] < sub2) ? 1 : 0;
+    a[2] -= sub2;
+    a[3] -= borrow;
+    return a;
+}
+
+// 5. Conversion en Double (Pour l'affichage de progression sans overflow)
+static double to_double(const std::array<uint64_t, 4>& v) {
+    return (double)v[0] + 
+           (double)v[1] * 18446744073709551616.0 + 
+           (double)v[2] * 340282366920938463463374607431768211456.0 +
+           (double)v[3] * 6277101735386680763835789423207666416102355444464034512896.0;
+}
+
 RuntimeConfig parseRuntimeArgs(int argc, char **argv) {
     RuntimeConfig cfg; cfg.loadPuzzleTarget();
     for (int i = 1; i < argc; ++i) {
@@ -229,11 +294,13 @@ RuntimeConfig parseRuntimeArgs(int argc, char **argv) {
         else if (parseArg(argv[i], "range", val)) {
             auto colon = val.find(':');
             if (colon != std::string::npos) {
+                // ON APPELLE LE 256 BITS ICI !
+                cfg.range_min_256 = parseHex256(val.substr(0, colon));
+                cfg.range_max_256 = parseHex256(val.substr(colon + 1));
                 cfg.range_is_hex = true;
-                cfg.range_min_hex = parseHex128(val.substr(0, colon));
-                cfg.range_max_hex = parseHex128(val.substr(colon + 1));
             } else {
                 cfg.puzzle_id = std::stoi(val);
+                cfg.range_is_hex = false;
             }
         }
         else if (parseArg(argv[i], "target", val)) {
@@ -247,7 +314,7 @@ RuntimeConfig parseRuntimeArgs(int argc, char **argv) {
 
 void print_result_key(uint64_t scalar_count[4]) {
     std::cout << "\n--- KEY RECONSTRUCTION ---\n";
-    std::cout << "PRIVATE KEY : 0x" << std::hex << std::setfill('0')
+    std::cout << "PRIVATE KEY : " << std::hex << std::setfill('0')
               << std::setw(16) << scalar_count[3] << std::setw(16) << scalar_count[2]
               << std::setw(16) << scalar_count[1] << std::setw(16) << scalar_count[0]
               << std::dec << "\n";
@@ -559,27 +626,36 @@ __global__ void __launch_bounds__(256, 2) kernel_solve(
     }
 }
 
-// --- INITIALISATION ---
-// --- INITIALISATION (Version 128-bit Stride) ---
-__global__ void kernel_init_scalars_stride(uint64_t *d_scalars, uint64_t bl, uint64_t bh, uint64_t st_lo, uint64_t st_hi, int bs, int tot, int mode) {
+// --- INITIALISATION (Version 256-bit Stride) ---
+__global__ void kernel_init_scalars_stride(uint64_t *d_scalars, uint64_t b0, uint64_t b1, uint64_t b2, uint64_t b3, uint64_t st_lo, uint64_t st_hi, int bs, int tot, int mode) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= tot) return;
     
-    unsigned __int128 res;
     unsigned __int128 stride_128 = ((unsigned __int128)st_hi << 64) | st_lo;
-
+    unsigned __int128 spacing = stride_128 * (unsigned __int128)bs;
+    
     if (mode == 0) { // Mode Recherche
-        unsigned __int128 base_128 = ((unsigned __int128)bh << 64) | bl;
-        unsigned __int128 spacing  = stride_128 * (unsigned __int128)bs;
-        res = base_128 + (spacing * (unsigned __int128)idx);
-    } else { // Mode Initialisation Tables
-        res = (unsigned __int128)(idx + 1) * stride_128;
-    }
+        unsigned __int128 total_add = spacing * (unsigned __int128)idx;
+        uint64_t add0 = (uint64_t)total_add;
+        uint64_t add1 = (uint64_t)(total_add >> 64);
 
-    d_scalars[idx * 4 + 0] = (uint64_t)(res);
-    d_scalars[idx * 4 + 1] = (uint64_t)(res >> 64);
-    d_scalars[idx * 4 + 2] = 0ULL; 
-    d_scalars[idx * 4 + 3] = 0ULL;
+        unsigned __int128 sum0 = (unsigned __int128)b0 + add0;
+        d_scalars[idx * 4 + 0] = (uint64_t)sum0;
+        
+        unsigned __int128 sum1 = (unsigned __int128)b1 + add1 + (sum0 >> 64);
+        d_scalars[idx * 4 + 1] = (uint64_t)sum1;
+        
+        unsigned __int128 sum2 = (unsigned __int128)b2 + (sum1 >> 64);
+        d_scalars[idx * 4 + 2] = (uint64_t)sum2;
+        
+        d_scalars[idx * 4 + 3] = b3 + (uint64_t)(sum2 >> 64);
+    } else { // Mode Initialisation Tables (base = 0)
+        unsigned __int128 res = (unsigned __int128)(idx + 1) * stride_128;
+        d_scalars[idx * 4 + 0] = (uint64_t)(res);
+        d_scalars[idx * 4 + 1] = (uint64_t)(res >> 64);
+        d_scalars[idx * 4 + 2] = 0ULL; 
+        d_scalars[idx * 4 + 3] = 0ULL;
+    }
 }
 
 void init_stride_tables(uint32_t batch_size, unsigned __int128 effective_stride) {
@@ -589,11 +665,12 @@ void init_stride_tables(uint32_t batch_size, unsigned __int128 effective_stride)
     cudaMalloc(&d_x, batch_size * 32);
     cudaMalloc(&d_y, batch_size * 32);
 
-    // Séparation du stride pour le kernel
     uint64_t st_lo = (uint64_t)effective_stride;
     uint64_t st_hi = (uint64_t)(effective_stride >> 64);
 
-    kernel_init_scalars_stride<<<1, 256>>>(d_s, 0, 0, st_lo, st_hi, 1, (int)batch_size, 1);
+    // CORRECTION : On passe 4 zéros pour b0, b1, b2, b3
+    kernel_init_scalars_stride<<<1, 256>>>(d_s, 0, 0, 0, 0, st_lo, st_hi, 1, (int)batch_size, 1);
+    
     scalarMulKernelBase<<<1, 256>>>(d_s, d_x, d_y, (int)batch_size);
     cudaDeviceSynchronize();
 
@@ -765,21 +842,31 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 3. Calculs du Range en 128-bit (Indispensable pour Range 131+)
-    unsigned __int128 range_min_128 = cfg.range_is_hex
-        ? cfg.range_min_hex
-        : ((unsigned __int128)1 << (cfg.puzzle_id - 1));
-    unsigned __int128 range_max_128 = cfg.range_is_hex
-        ? cfg.range_max_hex
-        : ((unsigned __int128)1 << cfg.puzzle_id);
+	// 3. Calculs du Range et Alignement CRT en 256-bit
+    std::array<uint64_t, 4> range_min_256 = cfg.range_min_256;
+    std::array<uint64_t, 4> range_max_256 = cfg.range_max_256;
     
+    // Si c'est un Puzzle ID (ex: -range=71) on calcule le min/max manuellement
+    if (!cfg.range_is_hex) {
+        unsigned __int128 p_min = ((unsigned __int128)1 << (cfg.puzzle_id - 1));
+        unsigned __int128 p_max = ((unsigned __int128)1 << cfg.puzzle_id);
+        range_min_256 = { (uint64_t)p_min, (uint64_t)(p_min >> 64), 0, 0 };
+        range_max_256 = { (uint64_t)p_max, (uint64_t)(p_max >> 64), 0, 0 };
+    }
+
     unsigned __int128 stride_128    = (unsigned __int128)cfg.stride;
     unsigned __int128 offset_128    = (unsigned __int128)cfg.offset;
-    unsigned __int128 dist          = (range_min_128 > offset_128) ? (range_min_128 - offset_128) : 0;
-    unsigned __int128 n_steps       = (dist + stride_128 - 1) / stride_128;
-    unsigned __int128 aligned_start = offset_128 + n_steps * stride_128;
-    unsigned __int128 total_keys_128 = (range_max_128 - aligned_start) / stride_128 + 1;
-    double total_keys_double = (double)total_keys_128;
+
+    // Calcul de l'alignement pour coller au CRT de Python
+    std::array<uint64_t, 4> dist = sub_256(range_min_256, offset_128);
+    unsigned __int128 rem = mod_stride(dist, stride_128);
+    unsigned __int128 adjustment = (rem == 0) ? 0 : (stride_128 - rem);
+    
+    // Le vrai point de départ de la boucle GPU
+    std::array<uint64_t, 4> aligned_start = add_256(range_min_256, adjustment);
+    
+    // Calcul de total_keys en double pour l'ETA (évite l'overflow)
+    double total_keys_double = (to_double(range_max_256) - to_double(aligned_start)) / (double)stride_128 + 1.0;
 
     // 4. Initialisation Device
     int device = 0;
@@ -832,17 +919,15 @@ int main(int argc, char *argv[]) {
     init_stride_tables(batch_size, stride_eff_128);
 
     // Calcul du point de départ centré (start + half_jump)
-    unsigned __int128 half_jump = (unsigned __int128)(batch_size / 2) * stride_eff_128;
-    unsigned __int128 start_centered = aligned_start + half_jump;
+	unsigned __int128 half_jump = (unsigned __int128)(batch_size / 2) * stride_eff_128;
+    std::array<uint64_t, 4> start_centered = add_256(aligned_start, half_jump);
 
-    // Lancement de l'initialisation des scalaires (Correction: passe st_lo et st_hi)
+    // Le kernel 256 bits attend les 4 uint64_t
     kernel_init_scalars_stride<<<blocks, threads>>>(
         d_s,
-        (uint64_t)start_centered, (uint64_t)(start_centered >> 64),
+        start_centered[0], start_centered[1], start_centered[2], start_centered[3],
         (uint64_t)stride_128, (uint64_t)(stride_128 >> 64),
-        1,
-        total_threads,
-        0
+        1, total_threads, 0
     );
 
     scalarMulKernelBase<<<blocks, threads>>>(d_s, d_x, d_y, total_threads);
@@ -850,16 +935,23 @@ int main(int argc, char *argv[]) {
     cudaMemset(d_cnt, 0xFF, total_threads*32);
 
     // 9. Affichage Info Console
-    std::cout << "======== CYCLOPE V1.1 (128-bit Engine) ================\n";
+    std::cout << "======== CYCLOPE V1.2 (256-bit parsing) ================\n";
     std::cout << "GPU         : " << prop.name << "\n";
     std::cout << "Target      : ";
-    if (cfg.range_is_hex) {
-        auto print128hex = [](unsigned __int128 v) {
-            uint64_t hi = (uint64_t)(v >> 64), lo = (uint64_t)v;
-            if (hi) std::cout << std::hex << hi;
-            std::cout << std::hex << std::setfill('0') << std::setw(hi ? 16 : 1) << lo << std::dec;
+	if (cfg.range_is_hex) {
+        auto print256hex = [](const std::array<uint64_t, 4>& v) {
+            bool started = false;
+            for (int i = 3; i >= 0; i--) {
+                if (v[i] > 0 || started || i == 0) {
+                    if (started) std::cout << std::hex << std::setfill('0') << std::setw(16) << v[i];
+                    else std::cout << std::hex << v[i];
+                    started = true;
+                }
+            }
+            std::cout << std::dec;
         };
-        print128hex(cfg.range_min_hex); std::cout << ":"; print128hex(cfg.range_max_hex); std::cout << "\n";
+        // CORRECTION : On affiche les nouvelles variables 256 bits
+        print256hex(range_min_256); std::cout << ":"; print256hex(range_max_256); std::cout << "\n";
     } else {
         std::cout << "Puzzle " << cfg.puzzle_id << "\n";
     }
@@ -931,7 +1023,7 @@ int main(int argc, char *argv[]) {
         
         // Envoi Telegram
         std::ostringstream msg;
-        msg << "*CYCLOPE HIT* \xF0\x9F\x91\x81\xEF\xB8\x8F\n\n*Key:* `0x" << std::hex << std::setfill('0')
+        msg << "*CYCLOPE HIT* \xF0\x9F\x91\x81\xEF\xB8\x8F\n\n*Key:* `" << std::hex << std::setfill('0')
             << std::setw(16) << k_final[3] << std::setw(16) << k_final[2] << std::setw(16) << k_final[1] << std::setw(16) << k_final[0] << "`";
         sendTelegramMessage(msg.str());
     } else {
